@@ -4,6 +4,7 @@ from rich.console import Console
 from rich.panel import Panel
 from datetime import datetime
 import json
+import time
 
 # Set up the Groq API client
 from groq import Groq
@@ -13,8 +14,11 @@ client = Groq(api_key="YOUR API KEY")
 
 # Define the models to use for each agent
 ORCHESTRATOR_MODEL = "mixtral-8x7b-32768"
-SUB_AGENT_MODEL = "mixtral-8x7b-32768"
-REFINER_MODEL = "llama3-70b-8192"
+#SUB_AGENT_MODEL = "mixtral-8x7b-32768"
+SUB_AGENT_MODEL = "llama3-70b-8192"
+#REFINER_MODEL = "llama3-70b-8192"
+REFINER_MODEL = "mixtral-8x7b-32768"
+SUB_AGENT_CONTEXT_SIZE = 32000
 
 # Initialize the Rich Console
 console = Console()
@@ -31,14 +35,17 @@ def opus_orchestrator(objective, file_content=None, previous_results=None):
         },
         {
             "role": "user",
-            "content": f"Based on the following objective{' and file content' if file_content else ''}, and the previous sub-task results (if any), please break down the objective into the next sub-task, and create a concise and detailed prompt for a subagent so it can execute that task. IMPORTANT!!! when dealing with code tasks make sure you check the code for errors and provide fixes and support as part of the next sub-task. If you find any bugs or have suggestions for better code, please include them in the next sub-task prompt. Please assess if the objective has been fully achieved. If the previous sub-task results comprehensively address all aspects of the objective, include the phrase 'The task is complete:' at the beginning of your response. If the objective is not yet fully achieved, break it down into the next sub-task and create a concise and detailed prompt for a subagent to execute that task.:\n\nObjective: {objective}" + ('\\nFile content:\\n' + file_content if file_content else '') + f"\n\nPrevious sub-task results:\n{previous_results_text}"
+            "content": f"Based on the following objective{' and file content' if file_content else ''}, and the previous sub-task results (if any), please break down the objective into the next sub-task, and create a concise and detailed prompt for a subagent so it can execute that task."
+                #+ " IMPORTANT!!! when dealing with code tasks make sure you check the code for errors and provide fixes and support as part of the next sub-task. If you find any bugs or have suggestions for better code, please include them in the next sub-task prompt."
+                + " IMPORTANT!!! when dealing with software requirements make sure they adhere the original objective and follow business analysis best practices including BABOK. If you find any inconsistency, lack of detail or have suggestions for better requirements, please include them in the next sub-task prompt."
+                + " Please assess if the objective has been fully achieved. If the previous sub-task results comprehensively address all aspects of the objective, include the phrase 'The task is complete:' at the beginning of your response. If the objective is not yet fully achieved, break it down into the next sub-task and create a concise and detailed prompt for a subagent to execute that task.:\n\nObjective: {objective}" + ('\\nFile content:\\n' + file_content if file_content else '') + f"\n\nPrevious sub-task results:\n{previous_results_text}"
         }
     ]
 
     opus_response = client.chat.completions.create(
         model=ORCHESTRATOR_MODEL,
         messages=messages,
-        max_tokens=8000
+        max_tokens=32000
     )
 
     response_text = opus_response.choices[0].message.content
@@ -49,8 +56,14 @@ def haiku_sub_agent(prompt, previous_haiku_tasks=None, continuation=False):
     if previous_haiku_tasks is None:
         previous_haiku_tasks = []
 
+    task_log = "\n".join(f"Task: {task['task']}\nResult: {task['result']}" for task in previous_haiku_tasks)
+    while len(previous_haiku_tasks) > 1 and len(task_log) > SUB_AGENT_CONTEXT_SIZE * 3:
+        previous_haiku_tasks.pop(0)
+        task_log = "\n".join(f"Task: {task['task']}\nResult: {task['result']}" for task in previous_haiku_tasks)
+        print("Truncated: \n" + task_log)
+
     continuation_prompt = "Continuing from the previous answer, please complete the response."
-    system_message = "Previous Haiku tasks:\n" + "\n".join(f"Task: {task['task']}\nResult: {task['result']}" for task in previous_haiku_tasks)
+    system_message = "Previous tasks:\n" + task_log
     if continuation:
         prompt = continuation_prompt
 
@@ -68,7 +81,7 @@ def haiku_sub_agent(prompt, previous_haiku_tasks=None, continuation=False):
     haiku_response = client.chat.completions.create(
         model=SUB_AGENT_MODEL,
         messages=messages,
-        max_tokens=8000
+        max_tokens=SUB_AGENT_CONTEXT_SIZE
     )
 
     response_text = haiku_response.choices[0].message.content
@@ -91,7 +104,7 @@ def opus_refine(objective, sub_task_results, filename, projectname, continuation
     opus_response = client.chat.completions.create(
         model=REFINER_MODEL,
         messages=messages,
-        max_tokens=8000
+        max_tokens=32000
     )
 
     response_text = opus_response.choices[0].message.content
@@ -143,7 +156,7 @@ objective = input("Please enter your objective with or without a text file path:
 # Check if the input contains a file path
 if "./" in objective or "/" in objective:
     # Extract the file path from the objective
-    file_path = re.findall(r'[./\w]+\.[\w]+', objective)[0]
+    file_path = re.findall(r'[./\w\-]+\.[\w]+', objective)[0]
     # Read the file content
     with open(file_path, 'r') as file:
         file_content = file.read()
@@ -154,6 +167,38 @@ else:
 
 task_exchanges = []
 haiku_tasks = []
+min_tasks  = 3
+iterations = 0
+
+sanitized_objective = re.sub(r'\W+', '_', objective)
+timestamp = datetime.now().strftime("%H-%M-%S")
+
+# Truncate the sanitized_objective to a maximum of 50 characters
+max_length = 25
+truncated_objective = sanitized_objective[:max_length] if len(sanitized_objective) > max_length else sanitized_objective
+
+# Update the filename to include the project name
+filename = f"{timestamp}_{truncated_objective}.md"
+refined_output = None
+
+# Prepare the full exchange log
+def write_log():
+    exchange_log = f"Objective: {objective}\n\n"
+    exchange_log += "=" * 40 + " Task Breakdown " + "=" * 40 + "\n\n"
+    for i, (prompt, result) in enumerate(task_exchanges, start=1):
+        exchange_log += f"Task {i}:\n"
+        exchange_log += f"Prompt: {prompt}\n"
+        exchange_log += f"Result: {result}\n\n"
+    if refined_output:
+        exchange_log += "=" * 40 + " Refined Final Output " + "=" * 40 + "\n\n"
+        exchange_log += refined_output
+
+        console.print(f"\n[bold]Refined Final output:[/bold]\n{refined_output}")
+
+    with open(filename, 'w') as file:
+        file.write(exchange_log)
+
+    print(f"\nFull exchange log saved to {filename}")
 
 while True:
     # Call Orchestrator to break down the objective into the next sub-task or provide the final output
@@ -164,34 +209,40 @@ while True:
     else:
         opus_result, _ = opus_orchestrator(objective, previous_results=previous_results)
 
-    if "The task is complete:" in opus_result:
+    if (iterations := iterations + 1) > min_tasks and "The task is complete:" in opus_result:
         # If Opus indicates the task is complete, exit the loop
         final_output = opus_result.replace("The task is complete:", "").strip()
         break
     else:
+        time.sleep(3)
         sub_task_prompt = opus_result
         # Append file content to the prompt for the initial call to haiku_sub_agent, if applicable
         if file_content_for_haiku and not haiku_tasks:
             sub_task_prompt = f"{sub_task_prompt}\n\nFile content:\n{file_content_for_haiku}"
         # Call haiku_sub_agent with the prepared prompt and record the result
-        sub_task_result = haiku_sub_agent(sub_task_prompt, haiku_tasks)
+        while True:
+            sub_task_result = haiku_sub_agent(sub_task_prompt, haiku_tasks)
+            redo = ""#input("Do you want to redo the task [yN]?")
+            if not re.search(r'^[yY]$', redo):
+                break
+            console.print(f"\n[bold]Redoing last task[/bold]\n")
         # Log the task and its result for future reference
         haiku_tasks.append({"task": sub_task_prompt, "result": sub_task_result})
         # Record the exchange for processing and output generation
         task_exchanges.append((sub_task_prompt, sub_task_result))
         # Prevent file content from being included in future haiku_sub_agent calls
         file_content_for_haiku = None
+        write_log()
+        time.sleep(3)
 
 # Create the .md filename
-sanitized_objective = re.sub(r'\W+', '_', objective)
-timestamp = datetime.now().strftime("%H-%M-%S")
 
 # Call Opus to review and refine the sub-task results
 refined_output = opus_refine(objective, [result for _, result in task_exchanges], timestamp, sanitized_objective)
 
 # Extract the project name from the refined output
-project_name_match = re.search(r'Project Name: (.*)', refined_output)
-project_name = project_name_match.group(1).strip() if project_name_match else sanitized_objective
+project_name_match = re.search(r'Project Name:\**(.*?)\**', refined_output)
+project_name = re.sub(r'[^a-zA-Z]', '', project_name_match.group(1).strip()) if project_name_match else sanitized_objective[0:40]
 
 # Extract the folder structure from the refined output
 folder_structure_match = re.search(r'<folder_structure>(.*?)</folder_structure>', refined_output, re.DOTALL)
@@ -205,31 +256,9 @@ if folder_structure_match:
         console.print(Panel(f"Invalid JSON string: [bold]{json_string}[/bold]", title="[bold red]Invalid JSON String[/bold red]", title_align="left", border_style="red"))
 
 # Extract code files from the refined output
-code_blocks = re.findall(r'Filename: (\S+)\s*```[\w]*\n(.*?)\n```', refined_output, re.DOTALL)
+code_blocks = re.findall(r'Filename:\** ([^\s\*]+?)\**\s*```[\w]*\n(.*?)\n```', refined_output, re.DOTALL)
 
 # Create the folder structure and code files
 create_folder_structure(project_name, folder_structure, code_blocks)
 
-# Truncate the sanitized_objective to a maximum of 50 characters
-max_length = 25
-truncated_objective = sanitized_objective[:max_length] if len(sanitized_objective) > max_length else sanitized_objective
-
-# Update the filename to include the project name
-filename = f"{timestamp}_{truncated_objective}.md"
-
-# Prepare the full exchange log
-exchange_log = f"Objective: {objective}\n\n"
-exchange_log += "=" * 40 + " Task Breakdown " + "=" * 40 + "\n\n"
-for i, (prompt, result) in enumerate(task_exchanges, start=1):
-    exchange_log += f"Task {i}:\n"
-    exchange_log += f"Prompt: {prompt}\n"
-    exchange_log += f"Result: {result}\n\n"
-
-exchange_log += "=" * 40 + " Refined Final Output " + "=" * 40 + "\n\n"
-exchange_log += refined_output
-
-console.print(f"\n[bold]Refined Final output:[/bold]\n{refined_output}")
-
-with open(filename, 'w') as file:
-    file.write(exchange_log)
-print(f"\nFull exchange log saved to {filename}")
+write_log()
